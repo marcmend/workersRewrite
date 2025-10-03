@@ -4,8 +4,4 @@ compatibility_date = "2024-11-01"
 
 [[kv_namespaces]]
 binding = "LOGS"
-id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"   # prod
-preview_id = "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"  # preview
-
-[vars]
-LOG_READ_TOKEN = "change-me-very-strong"
+id = "17e06d41adcf4e4f8e138d2081a1af75"

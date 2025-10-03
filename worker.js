@@ -1,116 +1,135 @@
+// worker.js
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    const target = url.searchParams.get("target");
-    const forcePreview = url.searchParams.get("preview") === "1";
+    const pathname = url.pathname.replace(/\/+$/, "") || "/";
 
-    if (url.pathname === "/_logs") {
+    // 1) Endpoint lecture des logs
+    if (pathname === "/_logs") {
       const token = url.searchParams.get("token");
       if (!token || token !== env.LOG_READ_TOKEN) {
         return new Response("Unauthorized", { status: 401 });
       }
       const list = await env.LOGS.list({ prefix: "log-" });
       const items = [];
-      for (const key of list.keys) {
-        const v = await env.LOGS.get(key.name);
+      for (const k of list.keys) {
+        const v = await env.LOGS.get(k.name);
         if (v) items.push(JSON.parse(v));
       }
       return json(items);
     }
 
+    // 2) Résolution de la cible
+    const target = resolveTarget(url);
     if (!target) return new Response("Missing ?target=…", { status: 400 });
 
-    // Log minimal
+    // 3) Log minimal (KV)
     const cf = request.cf ?? {};
     const entry = {
       ts: new Date().toISOString(),
       target,
       ip: request.headers.get("cf-connecting-ip"),
       ua: request.headers.get("user-agent"),
-      ref: request.headers.get("referer"),
+      referer: request.headers.get("referer"),
       geo: { country: cf.country, city: cf.city, region: cf.region, asn: cf.asn },
     };
-    ctx.waitUntil(env.LOGS.put(`log-${Date.now()}-${Math.random().toString(36).slice(2,7)}`, JSON.stringify(entry)));
+    ctx.waitUntil(
+      env.LOGS.put(
+        `log-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        JSON.stringify(entry)
+      )
+    );
 
-    const ua = (entry.ua || "").toLowerCase();
-    const isPreviewBot = looksLikeUnfurlBot(ua);
-    const shouldServePreview = forcePreview || isPreviewBot;
-
-    if (url.pathname === "/_debug" && shouldServePreview) {
-      const meta = await fetchAndExtract(target, request);
-      return json(meta);
-    }
-
-    if (shouldServePreview) {
+    // 4) Preview mirroring pour les bots d’unfurl (ou ?preview=1)
+    const forcePreview = url.searchParams.get("preview") === "1";
+    const isPreviewBot = looksLikeUnfurlBot((entry.ua || "").toLowerCase());
+    if (forcePreview || isPreviewBot) {
       try {
         const meta = await fetchAndExtract(target, request);
         return new Response(buildPreviewHtml(meta, target), {
           headers: { "content-type": "text/html; charset=utf-8" },
         });
       } catch {
+        // fallback => redirection
         return Response.redirect(target, 302);
       }
     }
 
-    // Visiteurs humains => redirige
+    // 5) Visiteurs humains => redirection
     return Response.redirect(target, 302);
   },
 };
+
+/** Mapping des URLs courtes => Instagram */
+function resolveTarget(url) {
+  // priorité au paramètre explicite
+  const qTarget = url.searchParams.get("target");
+  if (qTarget) return qTarget;
+
+  // /p/:id
+  const mPost = url.pathname.match(/^\/p\/([A-Za-z0-9_-]+)\/?$/);
+  if (mPost) return `https://www.instagram.com/p/${mPost[1]}/`;
+
+  // /reel/:id ou /reels/:id
+  const mReel = url.pathname.match(/^\/reels?\/([A-Za-z0-9_-]+)\/?$/);
+  if (mReel) return `https://www.instagram.com/reel/${mReel[1]}/`;
+
+  // (tu peux ajouter d'autres patterns ici : /tv/:id, /stories/:user/:id, etc.)
+  return null;
+}
 
 function looksLikeUnfurlBot(ua) {
   const sigs = [
     "whatsapp", "facebookexternalhit", "twitterbot", "slackbot", "linkedinbot",
     "discordbot", "telegrambot", "skypeuripreview", "vkshare", "pinterest",
     "applebot", "embedly", "iframely", "quora link preview",
-    // moteurs de recherche (facultatif) :
     "googlebot", "bingbot", "duckduckbot", "yandexbot", "ia_archiver",
   ];
   return sigs.some(s => ua.includes(s));
 }
 
 async function fetchAndExtract(targetUrl, request) {
-  // Forward quelques headers pour obtenir un HTML “réaliste”
-  const f = await fetch(targetUrl, {
+  const res = await fetch(targetUrl, {
     redirect: "follow",
     headers: {
+      // certains sites renvoient un HTML différent selon l’UA/langue :
       "user-agent": request.headers.get("user-agent") || "facebookexternalhit/1.1",
       "accept-language": request.headers.get("accept-language") || "en",
     },
   });
-  const html = await f.text();
+  const html = await res.text();
 
-  // 1) Essai avec HTMLRewriter (robuste)
-  let meta = { title: "", description: "", image: "", ogType: "website", ogUrl: targetUrl, twitterCard: "summary_large_image", canonical: targetUrl };
-  const collect = {};
+  // Collect via HTMLRewriter
+  let collected = {};
   const rewriter = new HTMLRewriter()
     .on("title", {
-      text(t) { collect._title = (collect._title || "") + t.text; }
+      text(t) { collected._title = (collected._title || "") + t.text; }
     })
-    .on('meta', {
+    .on("meta", {
       element(e) {
-        const name = e.getAttribute('name');
-        const prop = e.getAttribute('property');
-        const content = e.getAttribute('content');
+        const name = e.getAttribute("name");
+        const prop = e.getAttribute("property");
+        const content = e.getAttribute("content");
         if (!content) return;
         const key = (prop || name || "").toLowerCase();
-        collect[key] = content;
+        collected[key] = content;
       }
     })
-    .on('link[rel="canonical"]', { element(e){ collect.canonical = e.getAttribute('href'); } });
+    .on('link[rel="canonical"]', { element(e) { collected.canonical = e.getAttribute("href"); } });
 
-  // HTMLRewriter nécessite un stream/Response
-  const rwResponse = new Response(html);
-  await rewriter.transform(rwResponse).arrayBuffer(); // force le passage
+  await rewriter.transform(new Response(html)).arrayBuffer();
 
-  meta.title = collect["og:title"] || collect["twitter:title"] || collect._title || "";
-  meta.description = collect["og:description"] || collect["twitter:description"] || collect["description"] || "";
-  meta.image = collect["og:image"] || collect["twitter:image"] || "";
-  meta.ogType = collect["og:type"] || "website";
-  meta.ogUrl = collect["og:url"] || targetUrl;
-  meta.twitterCard = collect["twitter:card"] || (meta.image ? "summary_large_image" : "summary");
-  meta.canonical = collect.canonical || meta.ogUrl || targetUrl;
+  const meta = {
+    title: collected["og:title"] || collected["twitter:title"] || collected._title || "",
+    description: collected["og:description"] || collected["twitter:description"] || collected["description"] || "",
+    image: collected["og:image"] || collected["twitter:image"] || "",
+    ogType: collected["og:type"] || "website",
+    ogUrl: collected["og:url"] || targetUrl,
+    twitterCard: collected["twitter:card"] || (collected["og:image"] ? "summary_large_image" : "summary"),
+    canonical: collected.canonical || collected["og:url"] || targetUrl,
+  };
 
-  // 2) Fallback regex si nécessaire (si rien trouvé)
+  // fallback regex pour <title> si besoin
   if (!meta.title) {
     const m = html.match(/<title>([\s\S]*?)<\/title>/i);
     if (m) meta.title = m[1].trim();
@@ -136,7 +155,7 @@ ${meta.image ? `<meta property="og:image" content="${esc(meta.image)}">` : ""}
 <meta name="twitter:description" content="${esc(meta.description)}">
 ${meta.image ? `<meta name="twitter:image" content="${esc(meta.image)}">` : ""}
 <meta http-equiv="refresh" content="0; url=${esc(targetUrl)}">
-</head><body>If you are not redirected, <a href="${esc(targetUrl)}">click here</a>.</body></html>`;
+</head><body>If you are not redirected, <a href="${esc(targetUrl)}">open on Instagram</a>.</body></html>`;
 }
 
 function json(obj) {
